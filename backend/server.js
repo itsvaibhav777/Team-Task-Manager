@@ -66,16 +66,21 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Start
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\nTeam Task Manager API running on http://localhost:${PORT}`);
-  console.log(`   Health: http://localhost:${PORT}/api/health\n`);
-  console.log(`   CORS origins: ${allowedOrigins.join(', ') || 'none'}`);
-
-  // Eagerly initialize DB
+async function start() {
   const { getDb } = require('./src/db/database');
-  getDb();
-  console.log('Database initialized');
+  await getDb();
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`\nTeam Task Manager API running on http://localhost:${PORT}`);
+    console.log(`   Health: http://localhost:${PORT}/api/health\n`);
+    console.log(`   CORS origins: ${allowedOrigins.join(', ') || 'none'}`);
+    console.log('MongoDB initialized');
+  });
+}
+
+start().catch((err) => {
+  console.error('Failed to start server:', err);
+  process.exit(1);
 });
 
 module.exports = app;

@@ -1,40 +1,54 @@
 const express = require('express');
 const router = express.Router();
 const { body } = require('express-validator');
-const { getDb } = require('../db/database');
+const { formatRecord, getDb, nextId, parseAvatar, toInt } = require('../db/database');
 const { authenticate, requireProjectAccess, requireProjectAdmin } = require('../middleware/auth');
 const { validate } = require('../middleware/validate');
 
+async function projectSummary(db, project, myRole) {
+  const [owner, taskCount, completedTasks, memberCount] = await Promise.all([
+    db.collection('users').findOne({ id: project.owner_id }, { projection: { _id: 0, name: 1 } }),
+    db.collection('tasks').countDocuments({ project_id: project.id }),
+    db.collection('tasks').countDocuments({ project_id: project.id, status: 'done' }),
+    db.collection('project_members').countDocuments({ project_id: project.id }),
+  ]);
+
+  return {
+    ...formatRecord(project),
+    owner_name: owner?.name,
+    my_role: myRole,
+    task_count: taskCount,
+    completed_tasks: completedTasks,
+    member_count: memberCount,
+  };
+}
+
 // GET /api/projects - list all projects for user
-router.get('/', authenticate, (req, res) => {
+router.get('/', authenticate, async (req, res) => {
   try {
-    const db = getDb();
+    const db = await getDb();
     let projects;
+    let rolesByProject = new Map();
 
     if (req.user.role === 'admin') {
-      projects = db.prepare(`
-        SELECT p.*, u.name as owner_name,
-          (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) as task_count,
-          (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'done') as completed_tasks,
-          (SELECT COUNT(*) FROM project_members pm WHERE pm.project_id = p.id) as member_count
-        FROM projects p
-        JOIN users u ON p.owner_id = u.id
-        ORDER BY p.created_at DESC
-      `).all();
+      projects = await db.collection('projects').find({}, { projection: { _id: 0 } }).sort({ created_at: -1 }).toArray();
     } else {
-      projects = db.prepare(`
-        SELECT p.*, u.name as owner_name, pm.role as my_role,
-          (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) as task_count,
-          (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'done') as completed_tasks,
-          (SELECT COUNT(*) FROM project_members pmc WHERE pmc.project_id = p.id) as member_count
-        FROM projects p
-        JOIN users u ON p.owner_id = u.id
-        JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = ?
-        ORDER BY p.created_at DESC
-      `).all(req.user.id);
+      const memberships = await db.collection('project_members')
+        .find({ user_id: req.user.id }, { projection: { _id: 0, project_id: 1, role: 1 } })
+        .toArray();
+      const projectIds = memberships.map((membership) => membership.project_id);
+      rolesByProject = new Map(memberships.map((membership) => [membership.project_id, membership.role]));
+      projects = await db.collection('projects')
+        .find({ id: { $in: projectIds } }, { projection: { _id: 0 } })
+        .sort({ created_at: -1 })
+        .toArray();
     }
 
-    res.json(projects);
+    const summaries = await Promise.all(
+      projects.map((project) => projectSummary(db, project, rolesByProject.get(project.id)))
+    );
+
+    res.json(summaries);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to fetch projects' });
@@ -49,22 +63,34 @@ router.post('/', authenticate, [
   body('priority').optional().isIn(['low', 'medium', 'high', 'critical']),
   body('start_date').optional().isISO8601(),
   body('end_date').optional().isISO8601(),
-], validate, (req, res) => {
+], validate, async (req, res) => {
   try {
     const { name, description, status = 'active', priority = 'medium', start_date, end_date } = req.body;
-    const db = getDb();
+    const db = await getDb();
+    const now = new Date();
+    const project = {
+      id: await nextId('projects'),
+      name,
+      description,
+      status,
+      priority,
+      start_date,
+      end_date,
+      owner_id: req.user.id,
+      created_at: now,
+      updated_at: now,
+    };
 
-    const result = db.prepare(
-      'INSERT INTO projects (name, description, status, priority, start_date, end_date, owner_id) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    ).run(name, description, status, priority, start_date, end_date, req.user.id);
+    await db.collection('projects').insertOne(project);
+    await db.collection('project_members').insertOne({
+      id: await nextId('project_members'),
+      project_id: project.id,
+      user_id: req.user.id,
+      role: 'admin',
+      joined_at: now,
+    });
 
-    // Auto-add creator as admin member
-    db.prepare(
-      'INSERT INTO project_members (project_id, user_id, role) VALUES (?, ?, ?)'
-    ).run(result.lastInsertRowid, req.user.id, 'admin');
-
-    const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(result.lastInsertRowid);
-    res.status(201).json(project);
+    res.status(201).json(formatRecord(project));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to create project' });
@@ -72,36 +98,59 @@ router.post('/', authenticate, [
 });
 
 // GET /api/projects/:projectId
-router.get('/:projectId', authenticate, requireProjectAccess, (req, res) => {
+router.get('/:projectId', authenticate, requireProjectAccess, async (req, res) => {
   try {
-    const db = getDb();
-    const project = db.prepare(`
-      SELECT p.*, u.name as owner_name
-      FROM projects p JOIN users u ON p.owner_id = u.id
-      WHERE p.id = ?
-    `).get(req.params.projectId);
+    const db = await getDb();
+    const projectId = toInt(req.params.projectId);
+    const project = await db.collection('projects').findOne({ id: projectId }, { projection: { _id: 0 } });
 
     if (!project) return res.status(404).json({ error: 'Project not found' });
 
-    const members = db.prepare(`
-      SELECT u.id, u.name, u.email, u.avatar, u.role as system_role, pm.role as project_role, pm.joined_at
-      FROM project_members pm JOIN users u ON pm.user_id = u.id
-      WHERE pm.project_id = ?
-    `).all(req.params.projectId);
+    const [owner, memberships, tasks] = await Promise.all([
+      db.collection('users').findOne({ id: project.owner_id }, { projection: { _id: 0, name: 1 } }),
+      db.collection('project_members').find({ project_id: projectId }, { projection: { _id: 0 } }).toArray(),
+      db.collection('tasks').find({ project_id: projectId }, { projection: { _id: 0 } }).sort({ created_at: -1 }).toArray(),
+    ]);
 
-    const tasks = db.prepare(`
-      SELECT t.*, u.name as assignee_name, u.avatar as assignee_avatar, c.name as creator_name
-      FROM tasks t
-      LEFT JOIN users u ON t.assignee_id = u.id
-      JOIN users c ON t.creator_id = c.id
-      WHERE t.project_id = ?
-      ORDER BY t.created_at DESC
-    `).all(req.params.projectId);
+    const userIds = [...new Set([
+      ...memberships.map((membership) => membership.user_id),
+      ...tasks.map((task) => task.assignee_id).filter(Boolean),
+      ...tasks.map((task) => task.creator_id).filter(Boolean),
+    ])];
+    const users = await db.collection('users')
+      .find({ id: { $in: userIds } }, { projection: { _id: 0, id: 1, name: 1, email: 1, avatar: 1, role: 1 } })
+      .toArray();
+    const usersById = new Map(users.map((user) => [user.id, user]));
+
+    const members = memberships.map((membership) => {
+      const user = usersById.get(membership.user_id);
+      return {
+        id: user?.id,
+        name: user?.name,
+        email: user?.email,
+        avatar: parseAvatar(user?.avatar),
+        system_role: user?.role,
+        project_role: membership.role,
+        joined_at: formatRecord(membership).joined_at,
+      };
+    });
+
+    const enrichedTasks = tasks.map((task) => {
+      const assignee = usersById.get(task.assignee_id);
+      const creator = usersById.get(task.creator_id);
+      return {
+        ...formatRecord(task),
+        assignee_name: assignee?.name,
+        assignee_avatar: assignee?.avatar ? parseAvatar(assignee.avatar) : null,
+        creator_name: creator?.name,
+      };
+    });
 
     res.json({
-      ...project,
-      members: members.map(m => ({ ...m, avatar: JSON.parse(m.avatar || '{}') })),
-      tasks
+      ...formatRecord(project),
+      owner_name: owner?.name,
+      members,
+      tasks: enrichedTasks,
     });
   } catch (err) {
     console.error(err);
@@ -115,45 +164,48 @@ router.put('/:projectId', authenticate, requireProjectAdmin, [
   body('description').optional().isLength({ max: 1000 }),
   body('status').optional().isIn(['active', 'completed', 'on_hold', 'archived']),
   body('priority').optional().isIn(['low', 'medium', 'high', 'critical']),
-], validate, (req, res) => {
+], validate, async (req, res) => {
   try {
-    const { name, description, status, priority, start_date, end_date } = req.body;
-    const db = getDb();
-
-    const existing = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
+    const db = await getDb();
+    const projectId = toInt(req.params.projectId);
+    const existing = await db.collection('projects').findOne({ id: projectId });
     if (!existing) return res.status(404).json({ error: 'Project not found' });
 
-    db.prepare(`
-      UPDATE projects SET
-        name = COALESCE(?, name),
-        description = COALESCE(?, description),
-        status = COALESCE(?, status),
-        priority = COALESCE(?, priority),
-        start_date = COALESCE(?, start_date),
-        end_date = COALESCE(?, end_date),
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(name, description, status, priority, start_date, end_date, req.params.projectId);
+    const updates = {};
+    ['name', 'description', 'status', 'priority', 'start_date', 'end_date'].forEach((field) => {
+      if (req.body[field] !== undefined) updates[field] = req.body[field];
+    });
+    updates.updated_at = new Date();
 
-    const updated = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
-    res.json(updated);
+    await db.collection('projects').updateOne({ id: projectId }, { $set: updates });
+    const updated = await db.collection('projects').findOne({ id: projectId }, { projection: { _id: 0 } });
+    res.json(formatRecord(updated));
   } catch (err) {
     res.status(500).json({ error: 'Failed to update project' });
   }
 });
 
 // DELETE /api/projects/:projectId
-router.delete('/:projectId', authenticate, requireProjectAdmin, (req, res) => {
+router.delete('/:projectId', authenticate, requireProjectAdmin, async (req, res) => {
   try {
-    const db = getDb();
-    const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.projectId);
+    const db = await getDb();
+    const projectId = toInt(req.params.projectId);
+    const project = await db.collection('projects').findOne({ id: projectId });
     if (!project) return res.status(404).json({ error: 'Project not found' });
 
     if (req.user.role !== 'admin' && project.owner_id !== req.user.id) {
       return res.status(403).json({ error: 'Only project owner can delete this project' });
     }
 
-    db.prepare('DELETE FROM projects WHERE id = ?').run(req.params.projectId);
+    const tasks = await db.collection('tasks').find({ project_id: projectId }, { projection: { _id: 0, id: 1 } }).toArray();
+    const taskIds = tasks.map((task) => task.id);
+    await Promise.all([
+      db.collection('projects').deleteOne({ id: projectId }),
+      db.collection('project_members').deleteMany({ project_id: projectId }),
+      db.collection('tasks').deleteMany({ project_id: projectId }),
+      db.collection('task_comments').deleteMany({ task_id: { $in: taskIds } }),
+    ]);
+
     res.json({ message: 'Project deleted successfully' });
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete project' });
@@ -164,23 +216,39 @@ router.delete('/:projectId', authenticate, requireProjectAdmin, (req, res) => {
 router.post('/:projectId/members', authenticate, requireProjectAdmin, [
   body('userId').isInt().withMessage('Valid user ID required'),
   body('role').optional().isIn(['admin', 'member']),
-], validate, (req, res) => {
+], validate, async (req, res) => {
   try {
-    const { userId, role = 'member' } = req.body;
-    const db = getDb();
+    const { role = 'member' } = req.body;
+    const userId = toInt(req.body.userId);
+    const projectId = toInt(req.params.projectId);
+    const db = await getDb();
 
-    const user = db.prepare('SELECT id, name, email FROM users WHERE id = ?').get(userId);
+    const user = await db.collection('users').findOne(
+      { id: userId },
+      { projection: { _id: 0, id: 1, name: 1, email: 1 } }
+    );
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    const existing = db.prepare('SELECT id FROM project_members WHERE project_id = ? AND user_id = ?').get(req.params.projectId, userId);
+    const existing = await db.collection('project_members').findOne({ project_id: projectId, user_id: userId });
     if (existing) return res.status(409).json({ error: 'User is already a member' });
 
-    db.prepare('INSERT INTO project_members (project_id, user_id, role) VALUES (?, ?, ?)').run(req.params.projectId, userId, role);
+    await db.collection('project_members').insertOne({
+      id: await nextId('project_members'),
+      project_id: projectId,
+      user_id: userId,
+      role,
+      joined_at: new Date(),
+    });
 
-    // Notify user
-    db.prepare('INSERT INTO notifications (user_id, title, message, type) VALUES (?, ?, ?, ?)').run(
-      userId, 'Added to Project', `You have been added to a project as ${role}`, 'info'
-    );
+    await db.collection('notifications').insertOne({
+      id: await nextId('notifications'),
+      user_id: userId,
+      title: 'Added to Project',
+      message: `You have been added to a project as ${role}`,
+      type: 'info',
+      read: 0,
+      created_at: new Date(),
+    });
 
     res.status(201).json({ message: 'Member added successfully', user, role });
   } catch (err) {
@@ -189,17 +257,19 @@ router.post('/:projectId/members', authenticate, requireProjectAdmin, [
 });
 
 // DELETE /api/projects/:projectId/members/:userId - remove member
-router.delete('/:projectId/members/:userId', authenticate, requireProjectAdmin, (req, res) => {
+router.delete('/:projectId/members/:userId', authenticate, requireProjectAdmin, async (req, res) => {
   try {
-    const db = getDb();
-    const { projectId, userId } = req.params;
+    const db = await getDb();
+    const projectId = toInt(req.params.projectId);
+    const userId = toInt(req.params.userId);
 
-    const project = db.prepare('SELECT owner_id FROM projects WHERE id = ?').get(projectId);
-    if (parseInt(userId) === project.owner_id) {
+    const project = await db.collection('projects').findOne({ id: projectId }, { projection: { _id: 0, owner_id: 1 } });
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    if (userId === project.owner_id) {
       return res.status(400).json({ error: 'Cannot remove project owner' });
     }
 
-    db.prepare('DELETE FROM project_members WHERE project_id = ? AND user_id = ?').run(projectId, userId);
+    await db.collection('project_members').deleteOne({ project_id: projectId, user_id: userId });
     res.json({ message: 'Member removed successfully' });
   } catch (err) {
     res.status(500).json({ error: 'Failed to remove member' });

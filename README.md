@@ -10,12 +10,12 @@ TaskFlow is a premium, full-stack project management and task tracking web appli
 - **Projects & Kanban Boards:** Create projects, add members, and manage tasks using an intuitive Kanban board interface.
 - **Task Management:** Assign tasks, set priorities, manage due dates, and update statuses. Includes a dedicated comments section for each task.
 - **Notifications:** Receive alerts when added to a project or assigned a new task.
-- **Zero-Setup Database:** Uses a local, embedded SQLite database that initializes itself instantly.
+- **MongoDB Database:** Uses MongoDB for persistent users, projects, tasks, comments, and notifications.
 
 ## 🛠️ Technology Stack
 
 - **Frontend:** React, Vite, React Router, Recharts, Context API, pure custom CSS (modern UI, dark mode).
-- **Backend:** Node.js, Express.js, better-sqlite3, bcryptjs, jsonwebtoken.
+- **Backend:** Node.js, Express.js, MongoDB, bcryptjs, jsonwebtoken.
 
 ---
 
@@ -29,19 +29,20 @@ Because this project is separated into a **Backend** and a **Frontend**, you wil
 
 ### Step 2: Start the Backend Server
 1. Open a new terminal in VS Code (`Terminal > New Terminal` or press `` Ctrl + ` ``).
-2. Navigate to the backend folder by typing:
+2. Make sure MongoDB is running locally, or set `MONGODB_URI` in `backend/.env` to your MongoDB Atlas connection string.
+3. Navigate to the backend folder by typing:
    ```bash
    cd backend
    ```
-3. *(First time only)* Install the backend dependencies:
+4. *(First time only)* Install the backend dependencies:
    ```bash
    npm install
    ```
-4. Start the backend development server:
+5. Start the backend development server:
    ```bash
    npm run dev
    ```
-   *You should see a message saying "Team Task Manager API running on http://localhost:5000" and "✅ Database initialized". Leave this terminal tab open.*
+   *You should see a message saying "Team Task Manager API running on http://localhost:5000" and "MongoDB initialized". Leave this terminal tab open.*
 
 ### Step 3: Start the Frontend Server
 1. Open a **second** terminal window in VS Code (click the `+` button in the terminal panel or press `Ctrl + Shift + 5` to split the terminal).

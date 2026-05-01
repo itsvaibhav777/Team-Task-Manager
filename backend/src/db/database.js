@@ -1,102 +1,137 @@
-const Database = require('better-sqlite3');
-const path = require('path');
+const { MongoClient } = require('mongodb');
+const bcrypt = require('bcryptjs');
 
-const DB_PATH = path.join(__dirname, '../../data/taskmanager.db');
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017';
+const MONGODB_DB = process.env.MONGODB_DB || 'team_task_manager';
 
+let client;
 let db;
 
-function getDb() {
+async function getDb() {
   if (!db) {
-    const fs = require('fs');
-    const dir = path.dirname(DB_PATH);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-
-    db = new Database(DB_PATH);
-    db.pragma('journal_mode = WAL');
-    db.pragma('foreign_keys = ON');
-    initializeSchema();
+    client = new MongoClient(MONGODB_URI);
+    await client.connect();
+    db = client.db(MONGODB_DB);
+    await initializeSchema();
   }
+
   return db;
 }
 
-function initializeSchema() {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      email TEXT UNIQUE NOT NULL,
-      password TEXT NOT NULL,
-      role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('admin', 'member')),
-      avatar TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
+async function initializeSchema() {
+  await Promise.all([
+    db.collection('users').createIndex({ id: 1 }, { unique: true }),
+    db.collection('users').createIndex({ email: 1 }, { unique: true }),
+    db.collection('projects').createIndex({ id: 1 }, { unique: true }),
+    db.collection('project_members').createIndex({ id: 1 }, { unique: true }),
+    db.collection('project_members').createIndex({ project_id: 1, user_id: 1 }, { unique: true }),
+    db.collection('tasks').createIndex({ id: 1 }, { unique: true }),
+    db.collection('tasks').createIndex({ project_id: 1 }),
+    db.collection('tasks').createIndex({ assignee_id: 1 }),
+    db.collection('task_comments').createIndex({ id: 1 }, { unique: true }),
+    db.collection('task_comments').createIndex({ task_id: 1 }),
+    db.collection('notifications').createIndex({ id: 1 }, { unique: true }),
+    db.collection('notifications').createIndex({ user_id: 1, read: 1 }),
+  ]);
 
-    CREATE TABLE IF NOT EXISTS projects (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      description TEXT,
-      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'completed', 'on_hold', 'archived')),
-      priority TEXT NOT NULL DEFAULT 'medium' CHECK(priority IN ('low', 'medium', 'high', 'critical')),
-      start_date DATE,
-      end_date DATE,
-      owner_id INTEGER NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS project_members (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      project_id INTEGER NOT NULL,
-      user_id INTEGER NOT NULL,
-      role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('admin', 'member')),
-      joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE(project_id, user_id),
-      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS tasks (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      title TEXT NOT NULL,
-      description TEXT,
-      status TEXT NOT NULL DEFAULT 'todo' CHECK(status IN ('todo', 'in_progress', 'review', 'done')),
-      priority TEXT NOT NULL DEFAULT 'medium' CHECK(priority IN ('low', 'medium', 'high', 'critical')),
-      project_id INTEGER NOT NULL,
-      assignee_id INTEGER,
-      creator_id INTEGER NOT NULL,
-      due_date DATE,
-      estimated_hours REAL,
-      actual_hours REAL,
-      tags TEXT DEFAULT '[]',
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
-      FOREIGN KEY (assignee_id) REFERENCES users(id) ON DELETE SET NULL,
-      FOREIGN KEY (creator_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS task_comments (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      task_id INTEGER NOT NULL,
-      user_id INTEGER NOT NULL,
-      content TEXT NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS notifications (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
-      title TEXT NOT NULL,
-      message TEXT NOT NULL,
-      type TEXT DEFAULT 'info',
-      read INTEGER DEFAULT 0,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-  `);
+  await seedDemoUsers();
 }
 
-module.exports = { getDb };
+async function seedDemoUsers() {
+  const userCount = await db.collection('users').countDocuments();
+  if (userCount > 0) return;
+
+  const now = new Date();
+  await db.collection('users').insertMany([
+    {
+      id: await nextId('users'),
+      name: 'Demo Admin',
+      email: 'admin@demo.com',
+      password: bcrypt.hashSync('admin123', 12),
+      role: 'admin',
+      avatar: { initials: 'DA', color: '#6366f1' },
+      created_at: now,
+    },
+    {
+      id: await nextId('users'),
+      name: 'Demo Member',
+      email: 'member@demo.com',
+      password: bcrypt.hashSync('member123', 12),
+      role: 'member',
+      avatar: { initials: 'DM', color: '#10b981' },
+      created_at: now,
+    },
+  ]);
+}
+
+async function nextId(sequenceName) {
+  const result = await db.collection('counters').findOneAndUpdate(
+    { _id: sequenceName },
+    { $inc: { value: 1 } },
+    { upsert: true, returnDocument: 'after' }
+  );
+
+  if (result?.value && typeof result.value === 'object') {
+    return result.value.value;
+  }
+
+  return result?.value;
+}
+
+function toInt(value) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isNaN(parsed) ? value : parsed;
+}
+
+function stripMongoId(document) {
+  if (!document) return document;
+  const { _id, ...rest } = document;
+  return rest;
+}
+
+function parseAvatar(avatar) {
+  if (!avatar) return {};
+  if (typeof avatar === 'object') return avatar;
+
+  try {
+    return JSON.parse(avatar);
+  } catch (_err) {
+    return {};
+  }
+}
+
+function formatDate(value) {
+  if (!value) return value;
+  if (value instanceof Date) return value.toISOString();
+  return value;
+}
+
+function formatRecord(document) {
+  const record = stripMongoId(document);
+  if (!record) return record;
+
+  return {
+    ...record,
+    created_at: formatDate(record.created_at),
+    updated_at: formatDate(record.updated_at),
+    joined_at: formatDate(record.joined_at),
+  };
+}
+
+async function closeDb() {
+  if (client) {
+    await client.close();
+    client = null;
+    db = null;
+  }
+}
+
+module.exports = {
+  closeDb,
+  formatRecord,
+  getDb,
+  nextId,
+  parseAvatar,
+  stripMongoId,
+  toInt,
+};

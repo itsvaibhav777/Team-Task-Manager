@@ -1,112 +1,143 @@
 const express = require('express');
 const router = express.Router();
-const { getDb } = require('../db/database');
+const { formatRecord, getDb } = require('../db/database');
 const { authenticate } = require('../middleware/auth');
 
+function emptyProjectStats() {
+  return { total: 0, active: 0, completed: 0, on_hold: 0 };
+}
+
+function emptyTaskStats() {
+  return { total: 0, todo: 0, in_progress: 0, review: 0, done: 0, overdue: 0 };
+}
+
+function priorityRank(priority) {
+  return { critical: 0, high: 1, medium: 2, low: 3 }[priority] ?? 4;
+}
+
+function todayDate() {
+  return new Date().toISOString().slice(0, 10);
+}
+
 // GET /api/dashboard
-router.get('/', authenticate, (req, res) => {
+router.get('/', authenticate, async (req, res) => {
   try {
-    const db = getDb();
+    const db = await getDb();
     const userId = req.user.id;
     const isAdmin = req.user.role === 'admin';
 
-    const projectFilter = isAdmin
-      ? ''
-      : 'AND p.id IN (SELECT project_id FROM project_members WHERE user_id = ?)';
-    const taskFilter = isAdmin
-      ? ''
-      : 'AND t.project_id IN (SELECT project_id FROM project_members WHERE user_id = ?)';
-    const params = isAdmin ? [] : [userId];
+    let visibleProjectIds = null;
+    if (!isAdmin) {
+      const memberships = await db.collection('project_members')
+        .find({ user_id: userId }, { projection: { _id: 0, project_id: 1 } })
+        .toArray();
+      visibleProjectIds = memberships.map((membership) => membership.project_id);
+    }
 
-    // Project stats
-    const projectStats = db.prepare(`
-      SELECT
-        COUNT(*) as total,
-        SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as active,
-        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
-        SUM(CASE WHEN status = 'on_hold' THEN 1 ELSE 0 END) as on_hold
-      FROM projects p WHERE 1=1 ${projectFilter}
-    `).get(...params);
+    const projectFilter = isAdmin ? {} : { id: { $in: visibleProjectIds } };
+    const taskFilter = isAdmin ? {} : { project_id: { $in: visibleProjectIds } };
+    const [projects, tasks, unreadNotifications] = await Promise.all([
+      db.collection('projects').find(projectFilter, { projection: { _id: 0 } }).toArray(),
+      db.collection('tasks').find(taskFilter, { projection: { _id: 0 } }).toArray(),
+      db.collection('notifications').countDocuments({ user_id: userId, read: 0 }),
+    ]);
 
-    // Task stats
-    const taskStats = db.prepare(`
-      SELECT
-        COUNT(*) as total,
-        SUM(CASE WHEN t.status = 'todo' THEN 1 ELSE 0 END) as todo,
-        SUM(CASE WHEN t.status = 'in_progress' THEN 1 ELSE 0 END) as in_progress,
-        SUM(CASE WHEN t.status = 'review' THEN 1 ELSE 0 END) as review,
-        SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END) as done,
-        SUM(CASE WHEN t.due_date < date('now') AND t.status != 'done' THEN 1 ELSE 0 END) as overdue
-      FROM tasks t WHERE 1=1 ${taskFilter}
-    `).get(...params);
+    const projectStats = projects.reduce((stats, project) => {
+      stats.total += 1;
+      if (project.status === 'active') stats.active += 1;
+      if (project.status === 'completed') stats.completed += 1;
+      if (project.status === 'on_hold') stats.on_hold += 1;
+      return stats;
+    }, emptyProjectStats());
 
-    // My tasks (assigned to me)
-    const myTasks = db.prepare(`
-      SELECT t.*, p.name as project_name
-      FROM tasks t JOIN projects p ON t.project_id = p.id
-      WHERE t.assignee_id = ? AND t.status != 'done'
-      ORDER BY CASE WHEN t.priority = 'critical' THEN 0 WHEN t.priority = 'high' THEN 1 WHEN t.priority = 'medium' THEN 2 ELSE 3 END,
-               t.due_date ASC NULLS LAST
-      LIMIT 10
-    `).all(userId);
+    const today = todayDate();
+    const taskStats = tasks.reduce((stats, task) => {
+      stats.total += 1;
+      if (stats[task.status] !== undefined) stats[task.status] += 1;
+      if (task.due_date && task.due_date < today && task.status !== 'done') stats.overdue += 1;
+      return stats;
+    }, emptyTaskStats());
 
-    // Overdue tasks
-    const overdueTasks = db.prepare(`
-      SELECT t.*, p.name as project_name, u.name as assignee_name
-      FROM tasks t
-      JOIN projects p ON t.project_id = p.id
-      LEFT JOIN users u ON t.assignee_id = u.id
-      WHERE t.due_date < date('now') AND t.status != 'done' ${taskFilter}
-      ORDER BY t.due_date ASC
-      LIMIT 10
-    `).all(...params);
+    const projectsById = new Map(projects.map((project) => [project.id, project]));
+    const users = await db.collection('users')
+      .find({ id: { $in: [...new Set(tasks.map((task) => task.assignee_id).filter(Boolean))] } }, { projection: { _id: 0, id: 1, name: 1 } })
+      .toArray();
+    const usersById = new Map(users.map((user) => [user.id, user]));
 
-    // Recent activity (recently updated tasks)
-    const recentActivity = db.prepare(`
-      SELECT t.id, t.title, t.status, t.priority, t.updated_at,
-             p.name as project_name, u.name as assignee_name
-      FROM tasks t
-      JOIN projects p ON t.project_id = p.id
-      LEFT JOIN users u ON t.assignee_id = u.id
-      WHERE 1=1 ${taskFilter}
-      ORDER BY t.updated_at DESC
-      LIMIT 8
-    `).all(...params);
+    const myTasks = tasks
+      .filter((task) => task.assignee_id === userId && task.status !== 'done')
+      .sort((a, b) => priorityRank(a.priority) - priorityRank(b.priority)
+        || String(a.due_date || '9999-12-31').localeCompare(String(b.due_date || '9999-12-31')))
+      .slice(0, 10)
+      .map((task) => ({
+        ...formatRecord(task),
+        tags: task.tags || [],
+        project_name: projectsById.get(task.project_id)?.name,
+      }));
 
-    // Priority breakdown
-    const priorityBreakdown = db.prepare(`
-      SELECT priority, COUNT(*) as count
-      FROM tasks t WHERE t.status != 'done' ${taskFilter}
-      GROUP BY priority
-    `).all(...params);
+    const overdueTasks = tasks
+      .filter((task) => task.due_date && task.due_date < today && task.status !== 'done')
+      .sort((a, b) => String(a.due_date || '').localeCompare(String(b.due_date || '')))
+      .slice(0, 10)
+      .map((task) => ({
+        ...formatRecord(task),
+        tags: task.tags || [],
+        project_name: projectsById.get(task.project_id)?.name,
+        assignee_name: usersById.get(task.assignee_id)?.name,
+      }));
 
-    // Unread notifications count
-    const unreadCount = db.prepare(
-      'SELECT COUNT(*) as count FROM notifications WHERE user_id = ? AND read = 0'
-    ).get(userId);
+    const recentActivity = [...tasks]
+      .sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0))
+      .slice(0, 8)
+      .map((task) => ({
+        id: task.id,
+        title: task.title,
+        status: task.status,
+        priority: task.priority,
+        updated_at: formatRecord(task).updated_at,
+        project_name: projectsById.get(task.project_id)?.name,
+        assignee_name: usersById.get(task.assignee_id)?.name,
+      }));
 
-    // Top projects by task completion
-    const topProjects = db.prepare(`
-      SELECT p.id, p.name, p.status, p.priority, p.end_date,
-        COUNT(t.id) as total_tasks,
-        SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END) as done_tasks
-      FROM projects p
-      LEFT JOIN tasks t ON t.project_id = p.id
-      WHERE 1=1 ${projectFilter}
-      GROUP BY p.id
-      ORDER BY p.updated_at DESC
-      LIMIT 5
-    `).all(...params);
+    const priorityCounts = tasks
+      .filter((task) => task.status !== 'done')
+      .reduce((counts, task) => {
+        counts.set(task.priority, (counts.get(task.priority) || 0) + 1);
+        return counts;
+      }, new Map());
+    const priorityBreakdown = [...priorityCounts.entries()].map(([priority, count]) => ({ priority, count }));
+
+    const taskCountsByProject = tasks.reduce((counts, task) => {
+      const current = counts.get(task.project_id) || { total_tasks: 0, done_tasks: 0 };
+      current.total_tasks += 1;
+      if (task.status === 'done') current.done_tasks += 1;
+      counts.set(task.project_id, current);
+      return counts;
+    }, new Map());
+    const topProjects = [...projects]
+      .sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0))
+      .slice(0, 5)
+      .map((project) => {
+        const counts = taskCountsByProject.get(project.id) || { total_tasks: 0, done_tasks: 0 };
+        return {
+          id: project.id,
+          name: project.name,
+          status: project.status,
+          priority: project.priority,
+          end_date: project.end_date,
+          ...counts,
+        };
+      });
 
     res.json({
       projectStats,
       taskStats,
-      myTasks: myTasks.map(t => ({ ...t, tags: JSON.parse(t.tags || '[]') })),
-      overdueTasks: overdueTasks.map(t => ({ ...t, tags: JSON.parse(t.tags || '[]') })),
+      myTasks,
+      overdueTasks,
       recentActivity,
       priorityBreakdown,
-      unreadNotifications: unreadCount.count,
-      topProjects
+      unreadNotifications,
+      topProjects,
     });
   } catch (err) {
     console.error('Dashboard error:', err);
