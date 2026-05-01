@@ -10,8 +10,18 @@ const dashboardRoutes = require('./src/routes/dashboard');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:5173,http://localhost:5174,http://localhost:5175')
-  .split(',')
+const defaultOrigins = [
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'http://localhost:5175',
+  'https://team-task-manager-production-1353.up.railway.app',
+];
+const allowedOrigins = [
+  ...(process.env.CORS_ORIGINS || '').split(','),
+  process.env.FRONTEND_URL,
+  ...defaultOrigins,
+]
+  .filter(Boolean)
   .map((origin) => origin.trim())
   .filter(Boolean);
 
