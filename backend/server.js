@@ -70,6 +70,14 @@ if (fs.existsSync(frontendDistPath)) {
 // 404 for API routes
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Route not found' }));
 
+const path = require('path');
+// ─── Serve Frontend (Monolith) ────────────────────────────
+app.use(express.static(path.join(__dirname, '../frontend/dist')));
+
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '../frontend/dist/index.html'));
+});
+
 // Global error handler
 app.use((err, _req, res, _next) => {
   console.error('Unhandled error:', err);
