@@ -1,7 +1,7 @@
 import axios from 'axios';
 
 const getApiBaseUrl = () => {
-  const baseUrl = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
+  const baseUrl = import.meta.env.VITE_API_URL || (import.meta.env.PROD ? '/api' : 'http://localhost:5000/api');
   const trimmedUrl = baseUrl.replace(/\/+$/, '');
 
   return trimmedUrl.endsWith('/api') ? trimmedUrl : `${trimmedUrl}/api`;

@@ -1,6 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 
 const authRoutes = require('./src/routes/auth');
 const projectRoutes = require('./src/routes/projects');
@@ -57,8 +59,16 @@ app.use('/api/dashboard', dashboardRoutes);
 // Health check
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
-// 404
-app.use((_req, res) => res.status(404).json({ error: 'Route not found' }));
+const frontendDistPath = path.join(__dirname, '../frontend/dist');
+if (fs.existsSync(frontendDistPath)) {
+  app.use(express.static(frontendDistPath));
+  app.get(/^(?!\/api).*/, (_req, res) => {
+    res.sendFile(path.join(frontendDistPath, 'index.html'));
+  });
+}
+
+// 404 for API routes
+app.use('/api', (_req, res) => res.status(404).json({ error: 'Route not found' }));
 
 // Global error handler
 app.use((err, _req, res, _next) => {
