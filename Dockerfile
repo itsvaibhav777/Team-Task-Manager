@@ -1,14 +1,14 @@
 # ── Stage 1: Build the frontend ──────────────────────────────
-FROM node:22-alpine AS builder
+FROM node:22-slim AS builder
 
 WORKDIR /app
 
-# Copy all package files
-COPY package.json package-lock.json ./
+# Copy package files (NOT the lock file — it has Windows-specific bindings)
+COPY package.json ./
 COPY frontend/package.json ./frontend/
 COPY backend/package.json ./backend/
 
-# Install all dependencies
+# Fresh install to get correct linux native bindings for rolldown/vite
 RUN npm install
 
 # Copy source code
@@ -19,7 +19,7 @@ COPY backend/ ./backend/
 RUN cd frontend && npx vite build
 
 # ── Stage 2: Production image ───────────────────────────────
-FROM node:22-alpine AS production
+FROM node:22-slim AS production
 
 WORKDIR /app
 
